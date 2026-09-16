@@ -87,6 +87,7 @@ def transcribe(model, waveform: torch.Tensor, sample_rate: int, *,
         ``(abc_text, structure_text, result_dict)``。``structure_text`` 每行形如
         ``起始秒<tab>结束秒<tab>段落名``，供歌词格式化节点对齐字幕分段。
     """
+    print(f"YO YO YO")
     wav = waveform.detach().float().cpu()
     if wav.ndim == 3:
         wav = wav[0]
@@ -113,6 +114,29 @@ def transcribe(model, waveform: torch.Tensor, sample_rate: int, *,
     try:
         result = model.transcribe(wav, sampling_rate=_SAMPLE_RATE,
                                   output_dir=output_dir, **kwargs)
+        
+        # DEBUG: inspect what SheetSage2 actually predicted
+        events = result.get("events") or []
+
+        notes = []
+        for event in events:
+            for note in event.get("values", {}).get("melody", ()):
+                notes.append(note)
+
+        if notes:
+            pitches = [int(n["pitch"]) for n in notes]
+            tracks = sorted(set(int(n.get("track", -1)) for n in notes))
+
+            print("=== SHEETSAGE2 DEBUG ===")
+            print("PITCH RANGE:", min(pitches), max(pitches))
+            print("TRACKS:", tracks)
+            print("NOTE COUNT:", len(notes))
+            print("LOWEST:", sorted(pitches)[:10])
+            print("HIGHEST:", sorted(pitches)[-10:])
+            print("========================")
+        else:
+            print("=== SHEETSAGE2 DEBUG: NO MELODY NOTES ===")
+
     except RuntimeError as exc:
         result = getattr(exc, "result", None)
         if not isinstance(result, dict) or abc_error_mode == "strict":
@@ -175,8 +199,8 @@ def _fallback_abc_from_midi(result: dict, *, skip_invalid: bool = False) -> str:
     tempi_t, tempi = midi.get_tempo_changes()
     bpm = float(tempi[0]) if len(tempi) else 120.0
     bpm = min(300.0, max(30.0, bpm))
-    step_seconds = 60.0 / bpm / 8.0  # L:1/32
-    bar_steps = 32                  # M:4/4
+    step_seconds = 60.0 / bpm / 32.0  # L:1/128
+    bar_steps = 64                  # M:4/4
 
     pitched = [inst for inst in midi.instruments if not inst.is_drum and inst.notes]
     vocal = [i for i in pitched if "vocal" in (i.name or "").lower()]
@@ -186,20 +210,13 @@ def _fallback_abc_from_midi(result: dict, *, skip_invalid: bool = False) -> str:
 
     def events(instruments):
         rows = []
-        cursor = 0
-        for note in sorted((n for i in instruments for n in i.notes), key=lambda n: (n.start, n.pitch)):
+        for note in sorted(
+            (n for i in instruments for n in i.notes),
+            key=lambda n: (n.start, n.pitch)
+        ):
             start = max(0, int(round(note.start / step_seconds)))
             end = max(start + 1, int(round(note.end / step_seconds)))
-            if start < cursor:
-                if skip_invalid:
-                    continue
-                start = cursor
-            if end <= start:
-                if skip_invalid:
-                    continue
-                end = start + 1
             rows.append((start, end, int(note.pitch)))
-            cursor = end
         return rows
 
     def duration(n):
@@ -229,11 +246,11 @@ def _fallback_abc_from_midi(result: dict, *, skip_invalid: bool = False) -> str:
         return " ".join(out)
 
     title = str(result.get("title") or "SheetSage2 recovered score").replace("\n", " ")
-    lines = ["X:1", f"T:{title}", "M:4/4", "L:1/32", f"Q:1/4={bpm:.2f}", "K:C"]
-    lines += ["V:Vocal clef=treble name=\"Vocal\"", "[V:Vocal] " + voice_text(events(vocal))]
+    lines = ["X:1", f"T:{title}", "M:4/4", "L:1/128", f"Q:1/4={bpm:.2f}", "K:C"]
+    lines += ["V:Lead clef=treble name=\"Lead\"", "[V:Lead] " + voice_text(events(vocal))]
     if instrumental:
-        lines += ["V:Ins clef=treble name=\"Instrumental\"",
-                  "[V:Ins] " + voice_text(events(instrumental))]
+        lines += ["V:Acc clef=treble name=\"Accompaniment\"",
+                  "[V:Acc] " + voice_text(events(instrumental))]
     return "\n".join(lines) + "\n"
 
 
