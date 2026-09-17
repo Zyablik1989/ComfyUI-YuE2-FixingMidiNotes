@@ -153,9 +153,11 @@ def transcribe(model, waveform: torch.Tensor, sample_rate: int, *,
             result = dict(result)
             result.setdefault("abc_error", str(exc))
 
-    abc_text = result.get("abc") or ""
-    if not abc_text and abc_error_mode in {"snap_invalid_notes", "skip_invalid_notes"}:
+    abc_text = "" 
+    if abc_error_mode in {"snap_invalid_notes", "skip_invalid_notes", "fallback_full", "return_midi_only"}:
         abc_text = _fallback_abc_from_midi(result, skip_invalid=abc_error_mode == "skip_invalid_notes")
+    elif not result.get("abc"):
+        abc_text = _fallback_abc_from_midi(result, skip_invalid=False)
         result["abc"] = abc_text
         result["abc_recovery"] = abc_error_mode
         if output_dir:
@@ -183,24 +185,34 @@ def _midi_note_name(pitch: int) -> str:
 
 
 def _fallback_abc_from_midi(result: dict, *, skip_invalid: bool = False) -> str:
-    """Build a conservative 1/32-grid ABC score when SheetSage2 ABC export fails.
-
-    SheetSage2 occasionally produces a valid MIDI result but rejects a note that
-    is off its symbolic sub-beat grid.  This recovery path keeps the MIDI as the
-    authority and creates a simple, editable two-voice score.  It intentionally
-    omits chord symbols rather than inventing harmony.
-    """
+    """Build a high-precision 1/64-grid ABC score from MIDI."""
     import pretty_midi
+    import io
 
     data = result.get("midi") or (result.get("midis") or {}).get("melody")
     if not data:
-        raise RuntimeError("SheetSage2 did not return ABC or recoverable MIDI data")
+        raise RuntimeError("SheetSage2 did not return recoverable MIDI data")
+    
     midi = pretty_midi.PrettyMIDI(io.BytesIO(data))
     tempi_t, tempi = midi.get_tempo_changes()
     bpm = float(tempi[0]) if len(tempi) else 120.0
     bpm = min(300.0, max(30.0, bpm))
-    step_seconds = 60.0 / bpm / 32.0  # L:1/128
-    bar_steps = 64                  # M:4/4
+    
+    # HIGH PRECISION GRID: 1/64 (16 units per quarter note)
+    step_seconds = 60.0 / bpm / 16.0  
+    grid_units_per_quarter = 16
+    
+    # Dynamically detect time signature, default to 4/4
+    meter = result.get("time_signature", "4/4")
+    if not isinstance(meter, str):
+        meter = "4/4"
+    
+    parts = str(meter).split("/")
+    numerator = int(parts[0]) if len(parts) > 0 else 4
+    denominator = int(parts[1]) if len(parts) > 1 else 4
+    
+    # Calculate bar_steps: e.g., 3/4 at 1/64 grid = 3 * 16 = 48 units per bar
+    bar_steps = numerator * (grid_units_per_quarter * 4 // denominator)
 
     pitched = [inst for inst in midi.instruments if not inst.is_drum and inst.notes]
     vocal = [i for i in pitched if "vocal" in (i.name or "").lower()]
@@ -210,13 +222,20 @@ def _fallback_abc_from_midi(result: dict, *, skip_invalid: bool = False) -> str:
 
     def events(instruments):
         rows = []
-        for note in sorted(
-            (n for i in instruments for n in i.notes),
-            key=lambda n: (n.start, n.pitch)
-        ):
+        cursor = 0
+        for note in sorted((n for i in instruments for n in i.notes), key=lambda n: (n.start, n.pitch)):
             start = max(0, int(round(note.start / step_seconds)))
             end = max(start + 1, int(round(note.end / step_seconds)))
+            if start < cursor:
+                if skip_invalid:
+                    continue
+                start = cursor
+            if end <= start:
+                if skip_invalid:
+                    continue
+                end = start + 1
             rows.append((start, end, int(note.pitch)))
+            cursor = end
         return rows
 
     def duration(n):
@@ -224,7 +243,7 @@ def _fallback_abc_from_midi(result: dict, *, skip_invalid: bool = False) -> str:
 
     def voice_text(rows):
         if not rows:
-            return "z32 |"
+            return "z" + str(bar_steps) + " |"
         out, cursor = [], 0
         for start, end, pitch in rows:
             if start > cursor:
@@ -233,6 +252,7 @@ def _fallback_abc_from_midi(result: dict, *, skip_invalid: bool = False) -> str:
             pos = start
             while remaining:
                 part = min(remaining, bar_steps - (pos % bar_steps))
+                # Helper to get note name (assumes _midi_note_name is defined in your file)
                 token = _midi_note_name(pitch) + duration(part)
                 remaining -= part
                 pos += part
@@ -246,11 +266,11 @@ def _fallback_abc_from_midi(result: dict, *, skip_invalid: bool = False) -> str:
         return " ".join(out)
 
     title = str(result.get("title") or "SheetSage2 recovered score").replace("\n", " ")
-    lines = ["X:1", f"T:{title}", "M:4/4", "L:1/128", f"Q:1/4={bpm:.2f}", "K:C"]
-    lines += ["V:Lead clef=treble name=\"Lead\"", "[V:Lead] " + voice_text(events(vocal))]
+    lines = ["X:1", f"T:{title}", f"M:{meter}", "L:1/64", f"Q:1/4={bpm:.2f}", "K:C"]
+    lines += ["V:Vocal clef=treble name=\"Vocal\"", "[V:Vocal] " + voice_text(events(vocal))]
     if instrumental:
-        lines += ["V:Acc clef=treble name=\"Accompaniment\"",
-                  "[V:Acc] " + voice_text(events(instrumental))]
+        lines += ["V:Ins clef=treble name=\"Instrumental\"",
+                  "[V:Ins] " + voice_text(events(instrumental))]
     return "\n".join(lines) + "\n"
 
 

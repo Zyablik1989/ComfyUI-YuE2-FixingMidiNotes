@@ -146,7 +146,7 @@ class SheetSage2Transcribe:
     CATEGORY = "YuE2/SheetSage2"
 
     def transcribe(self, model, audio, melody_only, preset, max_seconds, save_outputs,
-                   abc_error_mode="strict", overlap_seconds=-1.0,
+                   abc_error_mode="snap_invalid_notes", overlap_seconds=-1.0,
                    lookahead_seconds=-1.0, auto_unload=False):
         wav, rate = mono_waveform(audio)
         out_dir = timestamp_dir("SheetSage2") if save_outputs else None

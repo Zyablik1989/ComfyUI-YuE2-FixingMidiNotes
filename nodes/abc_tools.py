@@ -263,7 +263,7 @@ class MelodyCleanup:
         else: threshold,outliers=remove_notes_shorter_than_ms,remove_pitch_outliers
         pitches=sorted(p for v,_s,p in score_notes(abc) if "vocal" in v.lower())
         median=pitches[len(pitches)//2] if pitches else 60
-        base_ms=60000/max(bpm,1)/32 # default L:1/128 used by SheetSage2
+        base_ms = 60000/max(bpm,1)/16 # Updated for L:1/64 grid
         voice="default"; removed_short=removed_outlier=0; lines=[]
         for raw in abc.splitlines():
             if raw.startswith("V:"): voice=raw[2:].strip().split()[0]
