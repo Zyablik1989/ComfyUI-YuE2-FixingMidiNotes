@@ -246,46 +246,82 @@ class VocalRangeRetarget:
 
 
 class MelodyCleanup:
-    DESCRIPTION="Conservatively removes very short or extreme Vocal notes from ABC by replacing them with equal-duration rests."
+    DESCRIPTION="Conservatively removes very short or extreme notes from ABC. Updated to be safe for instrumental tracks."
+
     @classmethod
     def INPUT_TYPES(cls): return {"required":{
-        "abc":("STRING",{"multiline":True}), "preset":(["off","light","medium","custom"],),
-        "remove_notes_shorter_than_ms":("FLOAT",{"default":40.,"min":0.,"max":500.,"step":5.}),
-        "remove_pitch_outliers":("BOOLEAN",{"default":True}),
-        "outlier_semitones":("INT",{"default":24,"min":6,"max":48})}}
+        "abc":("STRING",{"multiline":True}), 
+        "preset":(["off","light","medium","custom"],),
+        "target_voice":(["all", "vocal_only", "instrumental_only"], {"default": "all", "tooltip": "Which tracks to clean. 'all' applies to everything."}),
+        "remove_notes_shorter_than_ms":("FLOAT",{"default":20.,"min":0.,"max":500.,"step":5.}), # Lowered default to protect triplets
+        "remove_pitch_outliers":("BOOLEAN",{"default":False}), # Default FALSE for instruments!
+        "outlier_semitones":("INT",{"default":36,"min":12,"max":72})}} # 3 octaves, safe for piano/guitar
+
     RETURN_TYPES=("STRING","STRING"); RETURN_NAMES=("abc","report")
     FUNCTION="clean"; CATEGORY="YuE2/ABC"
-    def clean(self,abc,preset,remove_notes_shorter_than_ms,remove_pitch_outliers,outlier_semitones):
-        if preset=="off": return abc,"cleanup disabled"
-        _report,bpm,_key,_dur=analyze_abc(abc)
-        if preset=="light": threshold,outliers=30.,False
-        elif preset=="medium": threshold,outliers=50.,True
-        else: threshold,outliers=remove_notes_shorter_than_ms,remove_pitch_outliers
-        pitches=sorted(p for v,_s,p in score_notes(abc) if "vocal" in v.lower())
-        median=pitches[len(pitches)//2] if pitches else 60
-        base_ms = 60000/max(bpm,1)/16 # Updated for L:1/64 grid
-        voice="default"; removed_short=removed_outlier=0; lines=[]
+
+    def clean(self, abc, preset, target_voice, remove_notes_shorter_than_ms, remove_pitch_outliers, outlier_semitones):
+        if preset=="off": return abc, "cleanup disabled"
+        
+        _report, bpm, _key, _dur = analyze_abc(abc)
+        
+        if preset=="light": threshold, outliers = 30., False
+        elif preset=="medium": threshold, outliers = 50., True
+        else: threshold, outliers = remove_notes_shorter_than_ms, remove_pitch_outliers
+        
+        # Calculate median pitch safely across all notes
+        pitches = sorted(p for v, _s, p in score_notes(abc))
+        median = pitches[len(pitches)//2] if pitches else 60
+        
+        base_ms = 60000/max(bpm,1)/16 # Correct for L:1/64 grid
+        
+        voice="default"; removed_short=0; removed_outlier=0; lines=[]
+        
         for raw in abc.splitlines():
-            if raw.startswith("V:"): voice=raw[2:].strip().split()[0]
-            if "vocal" not in voice.lower() or re.match(r"^[A-Za-z]:",raw): lines.append(raw); continue
+            if raw.startswith("V:"): 
+                voice = raw[2:].strip().split()[0].lower()
+            
+            # Determine if we should process this line based on target_voice
+            is_vocal = "vocal" in voice
+            is_inst = any(x in voice for x in ["inst", "lead", "acc", "default"])
+            
+            should_process = False
+            if target_voice == "all":
+                should_process = True
+            elif target_voice == "vocal_only" and is_vocal:
+                should_process = True
+            elif target_voice == "instrumental_only" and is_inst:
+                should_process = True
+                
+            if not should_process or re.match(r"^[A-Za-z]:", raw): 
+                lines.append(raw)
+                continue
+            
             state={}; keyacc=_key_accidentals(re.search(r"(?m)^K:\s*(.+)$",abc).group(1) if re.search(r"(?m)^K:\s*(.+)$",abc) else "C")
+            
             def repl(m):
-                nonlocal removed_short,removed_outlier
+                nonlocal removed_short, removed_outlier
                 d=m.group("dur") or "1"
                 if "/" in d:
                     a,b=(d.split("/",1)+["2"])[:2]; units=(float(a) if a else 1)/(float(b) if b else 2)
                 else: units=float(d)
+                
                 pitch=_pitch(m,keyacc,state)
-                short=units*base_ms < threshold
-                extreme=outliers and abs(pitch-median)>outlier_semitones
+                short = units * base_ms < threshold
+                extreme = outliers and abs(pitch-median) > outlier_semitones
+                
                 if short or extreme:
-                    removed_short+=int(short); removed_outlier+=int(extreme and not short)
-                    return "z"+(m.group("dur") or "")
+                    removed_short += int(short)
+                    removed_outlier += int(extreme and not short)
+                    return "z" + (m.group("dur") or "")
                 return m.group(0)
+                
             pieces=[]
-            for quoted,seg in _music_segments(raw): pieces.append(seg if quoted else NOTE_RE.sub(repl,seg))
+            for quoted, seg in _music_segments(raw): 
+                pieces.append(seg if quoted else NOTE_RE.sub(repl, seg))
             lines.append("".join(pieces))
-        return "\n".join(lines).rstrip()+"\n",f"preset={preset} short_notes_removed={removed_short} pitch_outliers_removed={removed_outlier}"
+            
+        return "\n".join(lines).rstrip()+"\n", f"preset={preset} short_notes_removed={removed_short} pitch_outliers_removed={removed_outlier}"
 
 
 class ABCFileLoader:

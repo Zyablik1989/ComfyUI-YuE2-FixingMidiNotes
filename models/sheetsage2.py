@@ -138,6 +138,7 @@ def transcribe(model, waveform: torch.Tensor, sample_rate: int, *,
             print("=== SHEETSAGE2 DEBUG: NO MELODY NOTES ===")
 
     except RuntimeError as exc:
+        abc_error_mode = "fallback_full"
         result = getattr(exc, "result", None)
         if not isinstance(result, dict) or abc_error_mode == "strict":
             raise
@@ -155,8 +156,10 @@ def transcribe(model, waveform: torch.Tensor, sample_rate: int, *,
 
     abc_text = "" 
     if abc_error_mode in {"snap_invalid_notes", "skip_invalid_notes", "fallback_full", "return_midi_only"}:
+        print(f"FORCING FALLBACK FROM MIDI")
         abc_text = _fallback_abc_from_midi(result, skip_invalid=abc_error_mode == "skip_invalid_notes")
     elif not result.get("abc"):
+        print(f"NOT FORCING FALLBACK FROM MIDI")
         abc_text = _fallback_abc_from_midi(result, skip_invalid=False)
         result["abc"] = abc_text
         result["abc_recovery"] = abc_error_mode
@@ -217,8 +220,6 @@ def _fallback_abc_from_midi(result: dict, *, skip_invalid: bool = False) -> str:
     pitched = [inst for inst in midi.instruments if not inst.is_drum and inst.notes]
     vocal = [i for i in pitched if "vocal" in (i.name or "").lower()]
     instrumental = [i for i in pitched if i not in vocal]
-    if not vocal and pitched:
-        vocal, instrumental = [pitched[0]], pitched[1:]
 
     def events(instruments):
         rows = []
@@ -267,10 +268,10 @@ def _fallback_abc_from_midi(result: dict, *, skip_invalid: bool = False) -> str:
 
     title = str(result.get("title") or "SheetSage2 recovered score").replace("\n", " ")
     lines = ["X:1", f"T:{title}", f"M:{meter}", "L:1/64", f"Q:1/4={bpm:.2f}", "K:C"]
-    lines += ["V:Vocal clef=treble name=\"Vocal\"", "[V:Vocal] " + voice_text(events(vocal))]
+    if vocal:
+        lines += ["V:Vocal clef=treble name=\"Vocal\"", "[V:Vocal] " + voice_text(events(vocal))]
     if instrumental:
-        lines += ["V:Ins clef=treble name=\"Instrumental\"",
-                  "[V:Ins] " + voice_text(events(instrumental))]
+        lines += ["V:Lead clef=treble name=\"Lead\"", "[V:Lead] " + voice_text(events(instrumental))]
     return "\n".join(lines) + "\n"
 
 
