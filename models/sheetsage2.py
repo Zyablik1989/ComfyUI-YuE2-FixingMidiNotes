@@ -188,7 +188,7 @@ def _midi_note_name(pitch: int) -> str:
 
 
 def _fallback_abc_from_midi(result: dict, *, skip_invalid: bool = False) -> str:
-    """Build a high-precision 1/64-grid ABC score from MIDI."""
+    """Build a high-precision, musically quantized 1/64-grid ABC score from MIDI."""
     import pretty_midi
     import io
 
@@ -206,9 +206,13 @@ def _fallback_abc_from_midi(result: dict, *, skip_invalid: bool = False) -> str:
     grid_units_per_quarter = 16
     
     # Dynamically detect time signature, default to 4/4
-    meter = result.get("time_signature", "4/4")
-    if not isinstance(meter, str):
-        meter = "4/4"
+    meter = "4/4"
+    if "time_signature" in result:
+        ts = result["time_signature"]
+        if isinstance(ts, str):
+            meter = ts
+        elif isinstance(ts, (list, tuple)) and len(ts) >= 2:
+            meter = f"{ts[0]}/{ts[1]}"
     
     parts = str(meter).split("/")
     numerator = int(parts[0]) if len(parts) > 0 else 4
@@ -220,23 +224,38 @@ def _fallback_abc_from_midi(result: dict, *, skip_invalid: bool = False) -> str:
     pitched = [inst for inst in midi.instruments if not inst.is_drum and inst.notes]
     vocal = [i for i in pitched if "vocal" in (i.name or "").lower()]
     instrumental = [i for i in pitched if i not in vocal]
+    
+    # DO NOT force instruments into the vocal track.
+
+    # Valid durations in a 1/64 grid (from SheetSage2's native tokenizer)
+    # Includes standard notes (1, 2, 4, 8, 16, 32, 64) AND triplets (3, 6, 12, 24, 48)
+    VALID_DURATIONS = [1, 2, 3, 4, 6, 8, 12, 16, 24, 32, 48, 64, 96, 128, 192, 256]
+
+    def snap_duration(raw_units):
+        if raw_units <= 0:
+            return 1
+        # Snap to the closest valid musical duration
+        return min(VALID_DURATIONS, key=lambda x: abs(x - raw_units))
 
     def events(instruments):
         rows = []
-        cursor = 0
         for note in sorted((n for i in instruments for n in i.notes), key=lambda n: (n.start, n.pitch)):
-            start = max(0, int(round(note.start / step_seconds)))
-            end = max(start + 1, int(round(note.end / step_seconds)))
-            if start < cursor:
-                if skip_invalid:
-                    continue
-                start = cursor
-            if end <= start:
-                if skip_invalid:
-                    continue
-                end = start + 1
+            raw_start = note.start / step_seconds
+            raw_end = note.end / step_seconds
+            
+            # Snap start to nearest grid unit
+            start = max(0, int(round(raw_start)))
+            
+            # Calculate raw duration and snap to nearest VALID musical duration
+            raw_dur = raw_end - raw_start
+            dur = snap_duration(raw_dur)
+            
+            end = start + dur
+            
+            if skip_invalid and dur <= 1:
+                continue
+                
             rows.append((start, end, int(note.pitch)))
-            cursor = end
         return rows
 
     def duration(n):
@@ -249,29 +268,37 @@ def _fallback_abc_from_midi(result: dict, *, skip_invalid: bool = False) -> str:
         for start, end, pitch in rows:
             if start > cursor:
                 out.append("z" + duration(start - cursor))
-            remaining = end - start
-            pos = start
-            while remaining:
+            
+            # Handle overlaps gracefully by advancing cursor if needed
+            actual_start = max(start, cursor)
+            remaining = end - actual_start
+            if remaining <= 0:
+                continue
+                
+            pos = actual_start
+            while remaining > 0:
                 part = min(remaining, bar_steps - (pos % bar_steps))
-                # Helper to get note name (assumes _midi_note_name is defined in your file)
                 token = _midi_note_name(pitch) + duration(part)
                 remaining -= part
                 pos += part
-                out.append(token + ("-" if remaining else ""))
+                out.append(token + ("-" if remaining > 0 else ""))
                 if pos % bar_steps == 0:
                     out.append("|")
-            cursor = end
+            cursor = max(cursor, end)
+            
         if cursor % bar_steps:
-            out.append("z" + duration(bar_steps - cursor % bar_steps))
+            out.append("z" + duration(bar_steps - (cursor % bar_steps)))
             out.append("|")
         return " ".join(out)
 
     title = str(result.get("title") or "SheetSage2 recovered score").replace("\n", " ")
     lines = ["X:1", f"T:{title}", f"M:{meter}", "L:1/64", f"Q:1/4={bpm:.2f}", "K:C"]
+    
     if vocal:
         lines += ["V:Vocal clef=treble name=\"Vocal\"", "[V:Vocal] " + voice_text(events(vocal))]
     if instrumental:
         lines += ["V:Lead clef=treble name=\"Lead\"", "[V:Lead] " + voice_text(events(instrumental))]
+        
     return "\n".join(lines) + "\n"
 
 
